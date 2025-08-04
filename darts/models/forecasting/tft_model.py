@@ -50,6 +50,7 @@ class _TFTModule(PLMixedCovariatesModule):
         variables_meta: dict[str, dict[str, list[str]]],
         num_static_components: int,
         hidden_size: Union[int, list[int]],
+        rnn_type: str,
         lstm_layers: int,
         num_attention_heads: int,
         full_attention: bool,
@@ -77,8 +78,12 @@ class _TFTModule(PLMixedCovariatesModule):
         hidden_size : int
             hidden state size of the TFT. It is the main hyper-parameter and common across the internal TFT
             architecture.
+        rnn_type : str
+            type of recurrent neural network to use for the encoder and decoder. Can be either "LSTM", "GRU", or "RNN".
+            Defaults to "LSTM". LSTM supports both hidden and cell states, while GRU and RNN only use hidden states.
         lstm_layers : int
-            number of layers for the Long Short Term Memory (LSTM) Encoder and Decoder (1 is a good default).
+            number of layers for the recurrent neural network (RNN/LSTM/GRU) Encoder and Decoder (1 is a good default).
+            Note: This parameter retains its original name for backward compatibility, but applies to all RNN types.
         num_attention_heads : int
             number of attention heads (4 is a good default)
         full_attention : bool
@@ -117,6 +122,7 @@ class _TFTModule(PLMixedCovariatesModule):
         self.n_targets, self.loss_size = output_dim
         self.variables_meta = variables_meta
         self.num_static_components = num_static_components
+        self.rnn_type = rnn_type
         self.hidden_size = hidden_size
         self.hidden_continuous_size = hidden_continuous_size
         self.categorical_embedding_sizes = categorical_embedding_sizes
@@ -259,8 +265,9 @@ class _TFTModule(PLMixedCovariatesModule):
             layer_norm=self.layer_norm,
         )
 
-        # lstm encoder (history) and decoder (future) for local processing
-        self.lstm_encoder = _LSTM(
+        # rnn encoder (history) and decoder (future) for local processing
+        rnn_class = getattr(nn, self.rnn_type)
+        self.rnn_encoder = rnn_class(
             input_size=self.hidden_size,
             hidden_size=self.hidden_size,
             num_layers=self.lstm_layers,
@@ -268,7 +275,7 @@ class _TFTModule(PLMixedCovariatesModule):
             batch_first=True,
         )
 
-        self.lstm_decoder = _LSTM(
+        self.rnn_decoder = rnn_class(
             input_size=self.hidden_size,
             hidden_size=self.hidden_size,
             num_layers=self.lstm_layers,
@@ -577,41 +584,55 @@ class _TFTModule(PLMixedCovariatesModule):
             context=static_context_expanded[:, encoder_length:],
         )
 
-        # LSTM
+        # RNN
         # calculate initial state
         input_hidden = (
             self.static_context_hidden_encoder_grn(static_embedding)
             .expand(self.lstm_layers, -1, -1)
             .contiguous()
         )
-        input_cell = (
-            self.static_context_cell_encoder_grn(static_embedding)
-            .expand(self.lstm_layers, -1, -1)
-            .contiguous()
-        )
 
-        # run local lstm encoder
-        encoder_out, (hidden, cell) = self.lstm_encoder(
-            input=embeddings_varying_encoder, hx=(input_hidden, input_cell)
-        )
+        if self.rnn_type == "LSTM":
+            # LSTM requires both hidden and cell states
+            input_cell = (
+                self.static_context_cell_encoder_grn(static_embedding)
+                .expand(self.lstm_layers, -1, -1)
+                .contiguous()
+            )
 
-        # run local lstm decoder
-        decoder_out, _ = self.lstm_decoder(
-            input=embeddings_varying_decoder, hx=(hidden, cell)
-        )
+            # run local rnn encoder
+            encoder_out, (hidden, cell) = self.rnn_encoder(
+                input=embeddings_varying_encoder, hx=(input_hidden, input_cell)
+            )
 
-        lstm_layer = torch.cat([encoder_out, decoder_out], dim=dim_time)
+            # run local rnn decoder
+            decoder_out, _ = self.rnn_decoder(
+                input=embeddings_varying_decoder, hx=(hidden, cell)
+            )
+        else:
+            # GRU and RNN only use hidden state
+            # run local rnn encoder
+            encoder_out, hidden = self.rnn_encoder(
+                input=embeddings_varying_encoder, hx=input_hidden
+            )
+
+            # run local rnn decoder
+            decoder_out, _ = self.rnn_decoder(
+                input=embeddings_varying_decoder, hx=hidden
+            )
+
+        rnn_layer = torch.cat([encoder_out, decoder_out], dim=dim_time)
         input_embeddings = torch.cat(
             [embeddings_varying_encoder, embeddings_varying_decoder], dim=dim_time
         )
 
-        # post lstm GateAddNorm
-        lstm_out = self.post_lstm_gan(x=lstm_layer, skip=input_embeddings)
+        # post rnn GateAddNorm
+        rnn_out = self.post_lstm_gan(x=rnn_layer, skip=input_embeddings)
 
         # static enrichment
         static_context_enriched = self.static_context_enrichment(static_embedding)
         attn_input = self.static_enrichment_grn(
-            x=lstm_out,
+            x=rnn_out,
             context=self.expand_static_context(
                 context=static_context_enriched, time_steps=time_steps
             ),
@@ -634,10 +655,10 @@ class _TFTModule(PLMixedCovariatesModule):
         # feed-forward
         out = self.feed_forward_block(x=attn_out)
 
-        # skip connection over temporal fusion decoder from LSTM post _GateAddNorm
+        # skip connection over temporal fusion decoder from RNN post _GateAddNorm
         out = self.pre_output_gan(
             x=out,
-            skip=lstm_out[:, encoder_length:],
+            skip=rnn_out[:, encoder_length:],
         )
 
         # generate output for n_targets and loss_size elements for loss evaluation
@@ -659,6 +680,7 @@ class TFTModel(MixedCovariatesTorchModel):
         output_chunk_length: int,
         output_chunk_shift: int = 0,
         hidden_size: Union[int, list[int]] = 16,
+        rnn_type: str = "LSTM",
         lstm_layers: int = 1,
         num_attention_heads: int = 4,
         full_attention: bool = False,
@@ -718,8 +740,12 @@ class TFTModel(MixedCovariatesTorchModel):
         hidden_size
             Hidden state size of the TFT. It is the main hyper-parameter and common across the internal TFT
             architecture.
+        rnn_type
+            Type of recurrent neural network to use for the encoder and decoder. Can be either "LSTM", "GRU", or "RNN".
+            Defaults to "LSTM". LSTM supports both hidden and cell states, while GRU and RNN only use hidden states.
         lstm_layers
-            Number of layers for the Long Short Term Memory (LSTM) Encoder and Decoder (1 is a good default).
+            Number of layers for the recurrent neural network (RNN/LSTM/GRU) Encoder and Decoder (1 is a good default).
+            Note: This parameter retains its original name for backward compatibility, but applies to all RNN types.
         num_attention_heads
             Number of attention heads (4 is a good default)
         full_attention
@@ -947,6 +973,16 @@ class TFTModel(MixedCovariatesTorchModel):
         # extract pytorch lightning module kwargs
         self.pl_module_params = self._extract_pl_module_params(**model_kwargs)
 
+        # validate rnn_type parameter
+        if rnn_type not in ["RNN", "LSTM", "GRU"]:
+            raise_log(
+                ValueError(
+                    f"`rnn_type` must be one of 'RNN', 'LSTM', 'GRU', but got '{rnn_type}'"
+                ),
+                logger=logger,
+            )
+
+        self.rnn_type = rnn_type
         self.hidden_size = hidden_size
         self.lstm_layers = lstm_layers
         self.num_attention_heads = num_attention_heads
@@ -1143,6 +1179,7 @@ class TFTModel(MixedCovariatesTorchModel):
             variables_meta=variables_meta,
             num_static_components=n_static_components,
             hidden_size=self.hidden_size,
+            rnn_type=self.rnn_type,
             lstm_layers=self.lstm_layers,
             dropout=self.dropout,
             num_attention_heads=self.num_attention_heads,
