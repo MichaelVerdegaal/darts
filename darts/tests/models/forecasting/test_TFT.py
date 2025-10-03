@@ -435,3 +435,52 @@ class TestTFTModel:
         preds = model.predict(n=3, series=series)
         assert len(preds) == 3
         assert np.all(np.isfinite(preds.values()))
+
+    def test_attention_optimization(self):
+        """Test that the optimized attention mechanism produces correct results"""
+        import torch
+        from darts.models.forecasting.tft_submodels import _ScaledDotProductAttention
+
+        # Create test inputs
+        batch_size, seq_len, d_k = 2, 10, 16
+        torch.manual_seed(42)
+        q = torch.randn(batch_size, seq_len, d_k)
+        k = torch.randn(batch_size, seq_len, d_k)
+        v = torch.randn(batch_size, seq_len, d_k)
+
+        # Test 1: Basic functionality without mask
+        attention = _ScaledDotProductAttention(dropout=None, scale=True)
+        output, attn_weights = attention(q, k, v, mask=None)
+
+        # Verify output shape
+        assert output.shape == (batch_size, seq_len, d_k)
+        assert attn_weights.shape == (batch_size, seq_len, seq_len)
+
+        # Verify attention weights sum to 1 (after softmax)
+        assert torch.allclose(attn_weights.sum(dim=-1), torch.ones(batch_size, seq_len), atol=1e-6)
+
+        # Test 2: With mask
+        mask = torch.zeros(batch_size, seq_len, seq_len, dtype=torch.bool)
+        mask[:, :, -1] = True  # Mask last position
+        output_masked, attn_weights_masked = attention(q, k, v, mask=mask)
+
+        # Verify masked positions have very small attention weights
+        assert torch.all(attn_weights_masked[:, :, -1] < 1e-8)
+
+        # Test 3: Scaling behavior
+        attention_no_scale = _ScaledDotProductAttention(dropout=None, scale=False)
+        output_no_scale, attn_no_scale = attention_no_scale(q, k, v, mask=None)
+
+        # Outputs should be different when scaling is disabled
+        assert not torch.allclose(attn_weights, attn_no_scale, rtol=0.1)
+
+        # Test 4: With dropout (only in training mode)
+        attention_dropout = _ScaledDotProductAttention(dropout=0.1, scale=True)
+        attention_dropout.train()
+        output_train, _ = attention_dropout(q, k, v, mask=None)
+        attention_dropout.eval()
+        output_eval, _ = attention_dropout(q, k, v, mask=None)
+
+        # In eval mode, output should be deterministic
+        output_eval2, _ = attention_dropout(q, k, v, mask=None)
+        assert torch.allclose(output_eval, output_eval2)

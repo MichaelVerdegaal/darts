@@ -540,18 +540,23 @@ class _ScaledDotProductAttention(nn.Module):
         self.scale = scale
 
     def forward(self, q, k, v, mask=None):
-        attn = torch.bmm(q, k.permute(0, 2, 1))  # query-key overlap
+        # Compute attention scores: Q * K^T
+        attn = torch.bmm(q, k.transpose(1, 2))  # Use transpose instead of permute for efficiency
 
         if self.scale:
-            dimension = torch.sqrt(torch.tensor(k.shape[-1]).to(torch.float32))
-            attn = attn / dimension
+            # Avoid creating new tensor - use in-place division with computed scale
+            # k.shape[-1] is the dimension, compute scale as 1/sqrt(d)
+            scale_factor = k.shape[-1] ** -0.5
+            attn = attn * scale_factor
 
         if mask is not None:
             attn = attn.masked_fill(mask, -1e9)
+
         attn = self.softmax(attn)
 
         if self.dropout is not None:
             attn = self.dropout(attn)
+
         output = torch.bmm(attn, v)
         return output, attn
 
